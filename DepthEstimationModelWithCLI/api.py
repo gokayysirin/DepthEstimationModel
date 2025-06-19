@@ -1,6 +1,7 @@
 import os
 import uuid
 from typing import Dict
+from upload import upload_image 
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
@@ -59,7 +60,7 @@ async def predict(file: UploadFile = File(...)) -> Dict:
     output_path = None
     
     try:
-        # Dosya boyutu kontrolü
+        # Dosya boyutu kontrolü  
         file_content = await file.read()
         if len(file_content) > MAX_FILE_SIZE:
             raise HTTPException(
@@ -87,52 +88,82 @@ async def predict(file: UploadFile = File(...)) -> Dict:
         with open(input_path, "wb") as f:
             f.write(file_content)
         
-        # Derinlik haritası oluştur
-        result = depth_estimator.calculate_depthmap(input_path, output_path)
+        # 1. Derinlik haritası oluştur (Ana işlem)
+        print(f"Generating depth map for: {file.filename}")
+        depth_result = depth_estimator.calculate_depthmap(input_path, output_path)
         
-        if result is None:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to process the image. Please try again."
-            )
-        
-        # Sonuç kontrolü
-        if not os.path.exists(output_path):
+        # Derinlik haritası oluşturulup oluşturulmadığını kontrol et
+        if depth_result is None or not os.path.exists(output_path):
             raise HTTPException(
                 status_code=500,
                 detail="Depth map generation failed"
             )
         
+        print(f"Depth map generated successfully: {output_path}")
+        
+        # 2. İsteğe bağlı: Görüntüyü ImgBB'ye yükle (Yan işlem)
+        imgbb_url = None
+        upload_error_msg = None
+        
+        try:
+            print("Uploading image to ImgBB...")
+            imgbb_url = upload_image(output_path)
+            print(f"Image uploaded to ImgBB successfully: {imgbb_url}")
+        except Exception as upload_error:
+            # Upload başarısız olursa, ana işlemi etkilemesin
+            upload_error_msg = str(upload_error)
+            print(f"ImgBB upload failed (not critical): {upload_error_msg}")
+        
         # NPY dosyası varsa onun da yolunu al
         npy_filename = f"output_{file_id}_raw.npy"
         npy_path = os.path.join(OUTPUT_FOLDER, npy_filename)
         
+        # Response oluştur
         response_data = {
             "success": True,
             "message": "Depth map generated successfully",
             "file_id": file_id,
             "original_filename": file.filename,
             "depth_map_url": f"/outputs/{output_filename}",
-            "download_url": f"/download/{file_id}"
+            "download_url": f"/download/{file_id}",
+            "processing_info": {
+                "depth_estimation": "completed",
+                "imgbb_upload": "completed" if imgbb_url else "failed"
+            }
         }
+        
+        # ImgBB URL'si varsa ekle
+        if imgbb_url:
+            response_data["imgbb_url"] = imgbb_url
+            response_data["external_url_available"] = True
+        else:
+            response_data["external_url_available"] = False
+            if upload_error_msg:
+                response_data["upload_error"] = upload_error_msg
         
         # NPY dosyası varsa ekle
         if os.path.exists(npy_path):
             response_data["raw_data_available"] = True
             response_data["raw_data_url"] = f"/outputs/{npy_filename}"
+        else:
+            response_data["raw_data_available"] = False
         
         return response_data
         
     except HTTPException:
+        # HTTPException'ları olduğu gibi fırlat
         raise
     except Exception as e:
+        # Beklenmeyen hatalar
+        print(f"Unexpected error in predict endpoint: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"An unexpected error occurred: {str(e)}"
         )
     finally:
         # Geçici dosyaları temizle
-        cleanup_file(input_path)
+        if input_path:
+            cleanup_file(input_path)
 
 @app.get("/download/{file_id}")
 async def download_depth_map(file_id: str):
